@@ -1,0 +1,1054 @@
+/**
+ * @file IncubatorController.ino
+ * @author Gemini AI & User Collaboration
+ * @brief A comprehensive firmware for an ESP32-based incubator/greenhouse controller.
+ * @version 4.3 (Refactored & WiFi Reset)
+ * * Changes:
+ * - Refactored schedule checking logic into a single helper function to reduce code duplication.
+ * - Added a Wi-Fi reset feature: Hold down the BOOT button (GPIO 0) on startup to clear saved credentials.
+ * - Web UI accepts ONE target temperature and ONE target humidity.
+ * - Sketch computes min/max as target ±0.3 for both temperature and humidity.
+ * - Added browser time sync for hotspot mode scheduling.
+ */
+
+ // --- LIBRARIES ---
+#include <WiFi.h>
+#include <DNSServer.h>
+#include <WebServer.h>
+#include <WiFiManager.h>
+#include <DHT.h>
+#include <LiquidCrystal_I2C.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+#include <Preferences.h>
+#include <time.h>
+#include <vector>
+#include <algorithm>
+
+// --- CONFIGURATION: USER MUST SET THESE ---
+#define XAMPP_SERVER_IP "192.168.1.30" // IMPORTANT: Set this to your computer's local IP address
+#define PHP_PORT 80                      // Port for PHP server communication
+#define WEB_INTERFACE_PORT 8080          // Port for the custom web interface
+#define REPORT_SCRIPT_PATH "/greenhouse/report_data.php"       // For sending data to DB
+#define CONTROL_SCRIPT_PATH "/greenhouse/get_control_status.php" // For receiving commands from DB
+
+// --- HARDWARE PINS ---
+#define LIGHT_RELAY_PIN 26
+#define HUMIDIFIER_RELAY_PIN 25
+#define FAN_RELAY_PIN 33
+#define DHTPIN1 13
+#define DHTPIN2 14
+#define DHTPIN3 27
+#define WIFI_RESET_PIN 0 // BOOT button on most ESP32 boards
+#define DHTTYPE DHT22
+#define LCD_ADDR 0x27
+#define LCD_COLS 20
+#define LCD_ROWS 4
+
+// --- GLOBAL OBJECTS ---
+WiFiManager wifiManager;
+WebServer server(WEB_INTERFACE_PORT);  // Custom port for web interface
+DNSServer dnsServer;  // For hotspot mode
+DHT dht1(DHTPIN1, DHTTYPE), dht2(DHTPIN2, DHTTYPE), dht3(DHTPIN3, DHTTYPE);
+LiquidCrystal_I2C lcd(LCD_ADDR, LCD_COLS, LCD_ROWS);
+WiFiUDP ntpUDP;
+WiFiUDP broadcastUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 8 * 3600, 60000); // GMT+8 for Iloilo City, Philippines
+Preferences preferences;
+
+// --- GLOBAL VARIABLES & STATE ---
+String DEVICE_ID;
+float currentTemp = 0.0, currentHumid = 0.0;
+bool humidifierState = false, lightState = false, fanState = false;
+bool isConnectedToWifi = false;
+bool isAutoModeActive = false; // Is a local auto-schedule currently running?
+bool hotspotMode = false; // Is ESP32 running in hotspot mode?
+
+// --- CHANGES BY KINIT ---
+// --- UDP BROADCASTING ---
+const int udpPort = 8080;
+unsigned long lastBroadcast = 0;
+const unsigned long broadcastInterval = 5000;
+
+// PERSISTENCE
+String pairedPhoneId = "";
+
+// Add this near your other global boolean variables
+bool rebootPending = false;
+
+// --- [END] CHANGES BY KINIT ---
+
+// State fetched from Database
+String dbControlMode = "AUTO"; // Default to AUTO mode if DB is unreachable
+bool dbManualLight = false, dbManualFan = false, dbManualHumidifier = false;
+
+// Time sync variables for hotspot mode
+time_t deviceTime = 0;
+unsigned long timeSetMillis = 0;
+bool timeFromDeviceSet = false;
+
+// Scheduling Data
+struct AutoControlSchedule { time_t startTime, endTime; float tempMin, tempMax, humidMin, humidMax; };
+std::vector<AutoControlSchedule> autoSchedules;
+
+// --- TIMERS ---
+unsigned long lastDHTReadMillis = 0, lastDBReportMillis = 0, lastControlCheckMillis = 0, lastDBFetchMillis = 0, lastLCDUpdateMillis = 0;
+const long DHT_READ_INTERVAL = 5000, DB_REPORT_INTERVAL = 60000, CONTROL_CHECK_INTERVAL = 7000, DB_FETCH_INTERVAL = 15000, LCD_UPDATE_INTERVAL = 2000;
+
+// --- FUNCTION PROTOTYPES ---
+void handleRoot(), handleGetData(), handleGetAutoSchedules(), handleAddAutoSchedule(), handleRemoveAutoSchedule(), handleSetTime();
+void readDHTSensors(), updateLCD(), reportToDB(), fetchControlFromDB();
+void checkAndRunControlLogic(), applyRelayState(int pin, bool state), executeAutoControl(const AutoControlSchedule& schedule), turnAllRelaysOff();
+void saveAutoSchedules(), loadAutoSchedules();
+void startHotspotMode(), startWiFiConnection();
+time_t getCurrentTime();
+AutoControlSchedule* findActiveSchedule(time_t currentTime);
+
+// --- WEB PAGE CONTENT ---
+String getHtmlPage() {
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Incubator Controller</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background-color: #f0f4f8; margin: 0; padding: 20px; color: #333; }
+        .container { max-width: 800px; margin: 20px auto; background-color: #ffffff; border-radius: 12px; box-shadow: 0 4px 25px rgba(0,0,0,0.1); padding: 30px; }
+        h1, h2 { text-align: center; color: #2c3e50; }
+        h2 { border-bottom: 2px solid #eee; padding-bottom: 10px; margin-top: 40px; }
+        .grid-container { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 20px; align-items: end; }
+        .card { padding: 20px; background-color: #f8f9fa; border-radius: 8px; border: 1px solid #e9ecef; }
+        .card label { display: block; margin-bottom: 8px; font-size: 0.9em; color: #555; font-weight: 500; }
+        .card input { width: 100%; padding: 10px; border-radius: 5px; border: 1px solid #ccc; box-sizing: border-box; }
+        .card button { width: 100%; padding: 12px; border: none; border-radius: 5px; cursor: pointer; color: white; font-weight: bold; transition: background-color 0.3s ease; }
+        .btn-green { background-color: #27ae60; } .btn-green:hover { background-color: #229954; }
+        .btn-red { background-color: #e74c3c; padding: 5px 10px !important; } .btn-red:hover { background-color: #c0392b; }
+        .btn-blue { background-color: #17a2b8; } .btn-blue:hover { background-color: #138496; }
+        .data-display { display: flex; justify-content: space-around; margin-bottom: 20px; text-align: center; }
+        .data-item { background-color: #e9f5ff; padding: 15px 20px; border-radius: 8px; flex: 1; margin: 0 10px; }
+        .data-label { font-size: 0.9em; color: #555; }
+        .data-value { font-size: 1.8em; font-weight: bold; color: #0056b3; }
+        .status-box { text-align: center; font-size: 1.1em; margin: 20px 0; padding: 15px; border-radius: 8px; font-weight: 500; transition: all 0.3s ease; }
+        .status-active { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+        .status-manual { background-color: #fff3cd; color: #856404; border: 1px solid #ffeeba; }
+        .status-idle { background-color: #f8f9fa; color: #343a40; border: 1px solid #dee2e6; }
+        .schedules-list { list-style: none; padding: 0; }
+        .schedule-item { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 15px; padding: 15px; margin-bottom: 10px; background-color: #fff; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.05); }
+        .schedule-details { font-size: 0.95em; line-height: 1.5; }
+        .schedule-details span { display: block; }
+        .schedule-details .time { font-weight: bold; }
+        .schedule-details .targets { color: #555; }
+        .port-info { background-color: #e9f7ff; padding: 10px; border-radius: 5px; margin-bottom: 20px; text-align: center; font-size: 0.9em; color: #0066cc; }
+        .time-sync-info { background-color: #e8f4f8; padding: 10px; border-radius: 5px; margin-bottom: 20px; text-align: center; font-size: 0.9em; }
+        .time-status-success { color: #28a745; font-weight: bold; }
+        .time-status-error { color: #dc3545; font-weight: bold; }
+        .current-time { background-color: #f8f9fa; padding: 10px; border-radius: 5px; margin: 10px 0; text-align: center; font-family: monospace; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Incubator Controller</h1>
+        <div class="port-info">
+            Web Interface Port: )" + String(WEB_INTERFACE_PORT) + R"rawliteral( | Database Communication Port: )" + String(PHP_PORT) + R"rawliteral(<br>
+            <strong>)" + (hotspotMode ? "HOTSPOT MODE - Connect to 'Incubator_Setup' WiFi network" : "WIFI MODE") + R"rawliteral(</strong>
+        </div>
+
+        <div id="timeSyncInfo" class="time-sync-info" style="display: none;">
+            <strong>Hotspot Mode:</strong> Time automatically synced from your device<br>
+            <div id="timeStatus" style="margin-top: 5px;"></div>
+            <div class="current-time" id="currentTime">Current Time: --</div>
+            <button onclick="syncTimeWithDevice()" class="btn-blue" style="padding: 5px 15px; font-size: 0.9em;">
+                Sync Time Now
+            </button>
+        </div>
+
+        <div id="statusBox" class="status-box status-idle">System is Initializing...</div>
+        <div class="data-display">
+            <div class="data-item"><div class="data-label">Temperature</div><div class="data-value" id="temperature">--.- &deg;C</div></div>
+            <div class="data-item"><div class="data-label">Humidity</div><div class="data-value" id="humidity">--.- %</div></div>
+        </div>
+
+        <h2>Add New Climate Schedule</h2>
+        <div class="card">
+            <p style="text-align:center; margin-top:0; font-size:0.9em;">Schedules run when the system is in 'AUTO' mode.<br>Min/Max are computed as target ± 0.3 (done by the device).</p>
+            <div class="grid-container">
+                <div><label for="autoStartDate">Start Date & Time</label><input type="datetime-local" id="autoStartDate"></div>
+                <div><label for="autoEndDate">End Date & Time</label><input type="datetime-local" id="autoEndDate"></div>
+            </div>
+            <div class="grid-container" style="margin-top:20px;">
+                <div><label for="targetTemp">Target Temp (&deg;C)</label><input type="number" id="targetTemp" step="0.1" value="26.5"></div>
+                <div><label for="targetHumid">Target Humidity (%)</label><input type="number" id="targetHumid" step="0.1" value="67.0"></div>
+            </div>
+            <button onclick="addAutoSchedule()" class="btn-green" style="margin-top:20px;">Add to Schedule Queue</button>
+        </div>
+        <h2>Programmed Climate Cycles</h2>
+        <ul id="schedules-list" class="schedules-list"></ul>
+    </div>
+    <script>
+        let isHotspotMode = false;
+
+        function toLocalISOString(date) {
+            const z = n => ('0' + n).slice(-2);
+            return date.getFullYear() + '-' + z(date.getMonth() + 1) + '-' + z(date.getDate()) + 'T' + z(date.getHours()) + ':' + z(date.getMinutes());
+        }
+
+        // Time sync functions
+        async function syncTimeWithDevice() {
+            try {
+                const currentTime = Math.floor(Date.now() / 1000);
+
+                const response = await fetch('/setTime', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ timestamp: currentTime })
+                });
+
+                if (response.ok) {
+                    console.log('Time synced with device successfully');
+                    showTimeStatus('Time synced with your device ✓', 'success');
+                    updateCurrentTimeDisplay();
+                } else {
+                    console.error('Time sync failed');
+                    showTimeStatus('Time sync failed ✗', 'error');
+                }
+            } catch (error) {
+                console.error('Time sync error:', error);
+                showTimeStatus('Time sync error ✗', 'error');
+            }
+        }
+
+        function showTimeStatus(message, type) {
+            const statusDiv = document.getElementById('timeStatus');
+            if (statusDiv) {
+                statusDiv.innerText = message;
+                statusDiv.className = type === 'success' ? 'time-status-success' : 'time-status-error';
+
+                setTimeout(() => {
+                    statusDiv.innerText = '';
+                    statusDiv.className = '';
+                }, 3000);
+            }
+        }
+
+        function updateCurrentTimeDisplay() {
+            if (isHotspotMode) {
+                const now = new Date();
+                document.getElementById('currentTime').innerText = 'Current Time: ' + now.toLocaleString();
+            }
+        }
+
+        async function addAutoSchedule() {
+            const startTimeVal = document.getElementById('autoStartDate').value;
+            const endTimeVal = document.getElementById('autoEndDate').value;
+            if (!startTimeVal || !endTimeVal) { alert('Please set both a start and end time.'); return; }
+            const payload = {
+                startTime: Math.floor(new Date(startTimeVal).getTime() / 1000),
+                endTime: Math.floor(new Date(endTimeVal).getTime() / 1000),
+                targetTemp: parseFloat(document.getElementById('targetTemp').value),
+                targetHumid: parseFloat(document.getElementById('targetHumid').value)
+            };
+            if (payload.endTime <= payload.startTime) { alert('End time must be after start time.'); return; }
+
+            try {
+                const response = await fetch('/addAutoSchedule', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                if (response.ok) {
+                    fetchAndRenderSchedules();
+                    // Clear the form
+                    const now = new Date();
+                    const future = new Date(now.getTime() + 24*60*60*1000);
+                    document.getElementById('autoStartDate').value = toLocalISOString(now);
+                    document.getElementById('autoEndDate').value = toLocalISOString(future);
+                } else {
+                    const errorText = await response.text();
+                    console.error('Add schedule failed:', errorText);
+                    alert('Failed to add schedule: ' + errorText);
+                }
+            } catch (error) {
+                console.error('Network error adding schedule:', error);
+                alert('Network error adding schedule');
+            }
+        }
+
+        async function removeAutoSchedule(index) {
+            if (!confirm('Are you sure you want to delete this schedule?')) return;
+
+            try {
+                const response = await fetch('/removeAutoSchedule', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ index: index })
+                });
+
+                const responseText = await response.text();
+                console.log('Remove response:', responseText);
+
+                if (response.ok) {
+                    fetchAndRenderSchedules();
+                } else {
+                    console.error('Remove failed:', responseText);
+                    alert('Failed to remove schedule: ' + responseText);
+                }
+            } catch (error) {
+                console.error('Network error removing schedule:', error);
+                alert('Network error removing schedule');
+            }
+        }
+
+        async function fetchAndRenderSchedules() {
+            try {
+                const response = await fetch('/getAutoSchedules');
+                const scheduleData = await response.json();
+                const list = document.getElementById('schedules-list');
+                list.innerHTML = '';
+                if (scheduleData.length === 0) {
+                    list.innerHTML = '<p style="text-align:center;color:#777;">No schedules programmed.</p>';
+                } else {
+                    scheduleData.forEach((event, index) => {
+                        const item = document.createElement('li');
+                        item.className = 'schedule-item';
+                        const startDate = new Date(event.startTime * 1000);
+                        const endDate = new Date(event.endTime * 1000);
+
+                        // Check if schedule is currently active
+                        const now = new Date();
+                        const isActive = now >= startDate && now < endDate;
+                        const statusText = isActive ? ' <span style="color: #28a745; font-weight: bold;">[ACTIVE]</span>' : '';
+
+                        item.innerHTML = `
+                            <div class="schedule-details">
+                                <span class="time">FROM: ${startDate.toLocaleString()}${statusText}</span>
+                                <span class="time">TO: &nbsp;&nbsp;&nbsp;${endDate.toLocaleString()}</span>
+                                <span class="targets">Targets: ${event.tempMin.toFixed(1)}&deg;C - ${event.tempMax.toFixed(1)}&deg;C | ${event.humidMin.toFixed(1)}% - ${event.humidMax.toFixed(1)}%</span>
+                            </div>
+                            <button onclick="removeAutoSchedule(${index})" class="btn-red">Delete</button>
+                        `;
+                        list.appendChild(item);
+                    });
+                }
+            } catch (error) {
+                console.error('Error fetching schedules:', error);
+            }
+        }
+
+        async function updateData() {
+            try {
+                const response = await fetch('/data');
+                const data = await response.json();
+                document.getElementById('temperature').innerText = data.temperature.toFixed(1) + ' °C';
+                document.getElementById('humidity').innerText = data.humidity.toFixed(1) + ' %';
+                const statusBox = document.getElementById('statusBox');
+                if (data.dbControlMode === 'MANUAL') {
+                    statusBox.innerHTML = '<strong>DATABASE MANUAL OVERRIDE ACTIVE</strong>';
+                    statusBox.className = 'status-box status-manual';
+                } else if (data.isAutoModeActive) {
+                    statusBox.innerHTML = `<strong>AUTOMATIC CLIMATE CONTROL ACTIVE</strong>`;
+                    statusBox.className = 'status-box status-active';
+                } else {
+                    statusBox.innerHTML = isHotspotMode && !data.timeFromDeviceSet ?
+                        'System is IDLE - Waiting for time sync' : 'System is IDLE';
+                    statusBox.className = 'status-box status-idle';
+                }
+            } catch (error) {
+                console.error('Error fetching data:', error);
+            }
+        }
+
+        window.onload = () => {
+            // Detect hotspot mode
+            isHotspotMode = window.location.hostname === '192.168.4.1';
+
+            if (isHotspotMode) {
+                // Show time sync info
+                document.getElementById('timeSyncInfo').style.display = 'block';
+
+                // Sync time immediately
+                syncTimeWithDevice();
+
+                // Re-sync every 10 minutes
+                setInterval(syncTimeWithDevice, 10 * 60 * 1000);
+
+                // Update current time display every second
+                setInterval(updateCurrentTimeDisplay, 1000);
+                updateCurrentTimeDisplay();
+            }
+
+            const now = new Date();
+            const future = new Date(now.getTime() + 24*60*60*1000);
+            document.getElementById('autoStartDate').value = toLocalISOString(now);
+            document.getElementById('autoEndDate').value = toLocalISOString(future);
+            updateData();
+            fetchAndRenderSchedules();
+            setInterval(updateData, 5000);
+            setInterval(fetchAndRenderSchedules, 30000); // Refresh schedules every 30 seconds
+        };
+    </script>
+</body>
+</html>)rawliteral";
+  return html;
+}
+
+// --- [REPLACE YOUR ENTIRE EXISTING setup() FUNCTION WITH THIS] ---
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\nStarting Incubator Controller...");
+
+  // Initialize Hardware
+  pinMode(LIGHT_RELAY_PIN, OUTPUT); digitalWrite(LIGHT_RELAY_PIN, HIGH);
+  pinMode(HUMIDIFIER_RELAY_PIN, OUTPUT); digitalWrite(HUMIDIFIER_RELAY_PIN, HIGH);
+  pinMode(FAN_RELAY_PIN, OUTPUT); digitalWrite(FAN_RELAY_PIN, HIGH);
+  dht1.begin(); dht2.begin(); dht3.begin(); delay(2000);
+  lcd.init(); lcd.backlight(); lcd.clear();
+  DEVICE_ID = WiFi.macAddress(); DEVICE_ID.replace(":", "");
+
+  // --- WiFi Reset Feature ---
+  pinMode(WIFI_RESET_PIN, INPUT_PULLUP);
+  if (digitalRead(WIFI_RESET_PIN) == LOW) {
+    Serial.println("Reset button pressed. Clearing all settings...");
+    preferences.begin("device-config", false);
+    preferences.clear();
+    preferences.end();
+    wifiManager.resetSettings();
+    lcd.clear();
+    lcd.setCursor(0, 1); lcd.print("All settings have");
+    lcd.setCursor(0, 2); lcd.print("been reset.");
+    delay(3000);
+  }
+
+  // --- Connection Logic ---
+  preferences.begin("device-config", true);
+  pairedPhoneId = preferences.getString("paired_id", "");
+  preferences.end();
+
+  if (pairedPhoneId.isEmpty()) {
+    // NOT PAIRED: Start WiFiManager portal to get credentials
+    Serial.println("Device is not paired. Starting configuration portal.");
+    lcd.setCursor(0, 0); lcd.print("Mode: Pairing");
+    lcd.setCursor(0, 1); lcd.print("Connect to WiFi:");
+    lcd.setCursor(0, 2); lcd.print("'Incubator_Setup'");
+
+    wifiManager.setConnectTimeout(60);
+    wifiManager.setConfigPortalTimeout(180);
+    isConnectedToWifi = wifiManager.autoConnect("Incubator_Setup");
+  } else {
+    // ALREADY PAIRED: Connect directly to the saved network
+    Serial.println("Device is paired. Connecting to WiFi...");
+    lcd.setCursor(0, 0); lcd.print("Mode: Paired");
+    lcd.setCursor(0, 1); lcd.print("Connecting to WiFi..");
+
+    WiFi.mode(WIFI_STA); // Ensure we are in Station mode
+    WiFi.begin();
+    isConnectedToWifi = (WiFi.waitForConnectResult(20000) == WL_CONNECTED);
+  }
+
+  // --- Start Services ONLY if Connected ---
+  if (isConnectedToWifi) {
+    Serial.println("WiFi Connected! IP: " + WiFi.localIP().toString());
+    timeClient.begin();
+    loadAutoSchedules();
+
+    // Register ALL server routes ONCE
+    server.on("/", HTTP_GET, handleRoot);
+    server.on("/data", HTTP_GET, handleGetData);
+    server.on("/getAutoSchedules", HTTP_GET, handleGetAutoSchedules);
+    server.on("/addAutoSchedule", HTTP_POST, handleAddAutoSchedule);
+    server.on("/removeAutoSchedule", HTTP_POST, handleRemoveAutoSchedule);
+    server.on("/setTime", HTTP_POST, handleSetTime);
+    server.on("/pair", HTTP_POST, handlePair);
+    server.on("/set-name", HTTP_POST, handleSetName);
+    server.on("/unpair", HTTP_POST, handleUnpair);
+
+    server.begin(); // Start the server ONCE
+    Serial.printf("Web server started on port %d\n", WEB_INTERFACE_PORT);
+
+    if (pairedPhoneId.isEmpty()) {
+      broadcastUDP.begin(udpPort); // Only start broadcasting if we are NOT paired
+      Serial.println("UDP broadcast started for discovery.");
+    }
+    Serial.println("System Initialized.");
+  } else {
+    Serial.println("Failed to connect to WiFi. Please reset device and try again.");
+    lcd.clear();
+    lcd.setCursor(0,1); lcd.print("WiFi connection");
+    lcd.setCursor(0,2); lcd.print("failed. Pls reset.");
+  }
+}
+
+// --- MAIN LOOP ---
+void loop() {
+  if (rebootPending) {
+    delay(2000); // Wait 2 seconds for the network message to send
+    ESP.restart();
+  }
+
+  server.handleClient();
+
+  // Handle DNS requests in hotspot mode
+  if (hotspotMode) {
+    dnsServer.processNextRequest();
+  }
+
+  if (isConnectedToWifi) {
+    if (millis() - lastBroadcast > broadcastInterval) {
+      broadcastDeviceInfo();
+      lastBroadcast = millis();
+    }
+  }
+
+  unsigned long currentMillis = millis();
+  // Task 1: Read sensors
+  if (currentMillis - lastDHTReadMillis >= DHT_READ_INTERVAL) { lastDHTReadMillis = currentMillis; readDHTSensors(); }
+  // Task 2: Handle online functionality (fetching commands and reporting data) - only in WiFi mode
+  if (isConnectedToWifi && !hotspotMode) {
+    if (currentMillis - lastDBFetchMillis >= DB_FETCH_INTERVAL) {
+      lastDBFetchMillis = currentMillis;
+      timeClient.update();
+      fetchControlFromDB();
+    }
+    if (currentMillis - lastDBReportMillis >= DB_REPORT_INTERVAL) {
+      lastDBReportMillis = currentMillis;
+      reportToDB();
+    }
+  }
+  // Task 3: Execute control logic based on current mode
+  if (currentMillis - lastControlCheckMillis >= CONTROL_CHECK_INTERVAL) {
+    lastControlCheckMillis = currentMillis;
+    checkAndRunControlLogic();
+  }
+  // Task 4: Update the local display
+  if (currentMillis - lastLCDUpdateMillis >= LCD_UPDATE_INTERVAL) {
+    lastLCDUpdateMillis = currentMillis;
+    updateLCD();
+  }
+}
+
+// --- TIME FUNCTIONS ---
+time_t getCurrentTime() {
+  if (isConnectedToWifi && timeClient.isTimeSet()) {
+    // WiFi mode - use NTP time
+    return timeClient.getEpochTime();
+  } else if (hotspotMode && timeFromDeviceSet) {
+    // Hotspot mode - calculate time based on device sync
+    unsigned long elapsedSeconds = (millis() - timeSetMillis) / 1000;
+    return deviceTime + elapsedSeconds;
+  } else {
+    return 0; // No time available
+  }
+}
+
+// --- CORE LOGIC FUNCTIONS ---
+/**
+ * @brief Fetches the master control mode (MANUAL/AUTO) and states from the database.
+ */
+void fetchControlFromDB() {
+  if (!isConnectedToWifi) return;
+
+  HTTPClient http;
+  String url = "http://" + String(XAMPP_SERVER_IP) + ":" + String(PHP_PORT) + String(CONTROL_SCRIPT_PATH) + "?device_id=" + DEVICE_ID;
+  http.begin(url);
+  int httpCode = http.GET();
+  if (httpCode == HTTP_CODE_OK) {
+    String payload = http.getString();
+    StaticJsonDocument<256> doc;
+    DeserializationError error = deserializeJson(doc, payload);
+    if (!error) {
+      dbControlMode = doc["control_mode"] | "AUTO";
+      dbManualLight = doc["light_on"] | false;
+      dbManualFan = doc["fan_on"] | false;
+      dbManualHumidifier = doc["humid_on"] | false;
+    }
+  } else {
+    Serial.printf("HTTP GET for control failed, error: %d\n", httpCode);
+    dbControlMode = "AUTO"; // Fallback to auto on connection failure
+  }
+  http.end();
+}
+
+/**
+ * @brief NEW: Helper function to find the currently active schedule.
+ * @param currentTime The current epoch time.
+ * @return A pointer to the active AutoControlSchedule, or nullptr if none is active.
+ */
+AutoControlSchedule* findActiveSchedule(time_t currentTime) {
+    if (currentTime == 0) return nullptr; // Return null if time isn't set
+
+    for (auto& schedule : autoSchedules) { // Use auto& to iterate by reference
+        if (currentTime >= schedule.startTime && currentTime < schedule.endTime) {
+            return &schedule; // Return a pointer to the active schedule
+        }
+    }
+    return nullptr; // No active schedule found
+}
+
+/**
+ * @brief REFACTORED: Main logic router that decides which control mode to use.
+ */
+void checkAndRunControlLogic() {
+  // Priority 1: Database Manual Override (only in WiFi mode)
+  if (dbControlMode == "MANUAL" && isConnectedToWifi) {
+    isAutoModeActive = false; // Ensure auto mode is marked as off
+    if (lightState != dbManualLight) { lightState = dbManualLight; applyRelayState(LIGHT_RELAY_PIN, lightState); }
+    if (fanState != dbManualFan) { fanState = dbManualFan; applyRelayState(FAN_RELAY_PIN, fanState); }
+    if (humidifierState != dbManualHumidifier) { humidifierState = dbManualHumidifier; applyRelayState(HUMIDIFIER_RELAY_PIN, humidifierState); }
+    return;
+  }
+
+  // Priority 2: Local Automatic Schedule (for AUTO mode in WiFi or any Hotspot mode)
+  if (dbControlMode == "AUTO" || hotspotMode) {
+      time_t now = getCurrentTime();
+      AutoControlSchedule* activeSchedule = findActiveSchedule(now);
+
+      if (activeSchedule != nullptr) {
+          executeAutoControl(*activeSchedule); // Dereference the pointer to pass the schedule object
+          isAutoModeActive = true;
+      } else {
+          turnAllRelaysOff();
+          isAutoModeActive = false;
+      }
+      return;
+  }
+
+  // Priority 3: Default to OFF if no other mode is active
+  isAutoModeActive = false;
+  turnAllRelaysOff();
+}
+
+/**
+ * @brief Executes the climate control logic for a given active schedule.
+ */
+void executeAutoControl(const AutoControlSchedule& schedule) {
+  bool lightShouldBeOn = (currentTemp < schedule.tempMin);
+  bool fanShouldBeOnForTemp = (currentTemp > schedule.tempMax);
+  bool humidifierShouldBeOn = (currentHumid < schedule.humidMin);
+  bool fanShouldBeOnForHumid = (currentHumid > schedule.humidMax);
+  bool fanShouldBeOn = fanShouldBeOnForTemp || fanShouldBeOnForHumid;
+  if (lightState != lightShouldBeOn) { lightState = lightShouldBeOn; applyRelayState(LIGHT_RELAY_PIN, lightState); }
+  if (humidifierState != humidifierShouldBeOn) { humidifierState = humidifierShouldBeOn; applyRelayState(HUMIDIFIER_RELAY_PIN, humidifierState); }
+  if (fanState != fanShouldBeOn) { fanState = fanShouldBeOn; applyRelayState(FAN_RELAY_PIN, fanState); }
+}
+
+/**
+ * @brief Turns all relays off and updates their state variables.
+ */
+void turnAllRelaysOff() {
+  if(lightState) { lightState = false; applyRelayState(LIGHT_RELAY_PIN, false); }
+  if(humidifierState) { humidifierState = false; applyRelayState(HUMIDIFIER_RELAY_PIN, false); }
+  if(fanState) { fanState = false; applyRelayState(FAN_RELAY_PIN, false); }
+}
+
+// --- WEB SERVER HANDLERS ---
+void handleRoot(){ server.send(200, "text/html", getHtmlPage()); }
+
+void handleGetData() {
+    StaticJsonDocument<256> doc;
+    doc["temperature"] = currentTemp;
+    doc["humidity"] = currentHumid;
+    doc["isAutoModeActive"] = isAutoModeActive;
+    doc["dbControlMode"] = dbControlMode;
+    doc["timeFromDeviceSet"] = timeFromDeviceSet;
+    doc["lightState"] = lightState;
+    doc["humidifierState"] = humidifierState;
+    doc["fanState"] = fanState;
+    String jsonResponse;
+    serializeJson(doc, jsonResponse);
+    server.send(200, "application/json", jsonResponse);
+}
+
+void handleSetTime() {
+    if (server.hasArg("plain")) {
+        String requestBody = server.arg("plain");
+        Serial.println("Set time request: " + requestBody);
+
+        DynamicJsonDocument doc(128);
+        DeserializationError error = deserializeJson(doc, requestBody);
+
+        if (!error && doc.containsKey("timestamp")) {
+            deviceTime = doc["timestamp"];
+            timeSetMillis = millis();
+            timeFromDeviceSet = true;
+
+            Serial.println("Time synced from device: " + String(deviceTime));
+            time_t currentTime = getCurrentTime();
+            Serial.println("Current calculated time: " + String(currentTime));
+            server.send(200, "text/plain", "OK");
+        } else {
+            Serial.println("Invalid time data received");
+            server.send(400, "text/plain", "INVALID_TIME");
+        }
+    } else {
+        Serial.println("No time data received");
+        server.send(400, "text/plain", "NO_BODY");
+    }
+}
+
+void handleGetAutoSchedules() {
+  DynamicJsonDocument doc(4096);
+  JsonArray array = doc.to<JsonArray>();
+  for (const auto& schedule : autoSchedules) {
+    JsonObject obj = array.add<JsonObject>();
+    obj["startTime"] = schedule.startTime;
+    obj["endTime"] = schedule.endTime;
+    obj["tempMin"] = schedule.tempMin;
+    obj["tempMax"] = schedule.tempMax;
+    obj["humidMin"] = schedule.humidMin;
+    obj["humidMax"] = schedule.humidMax;
+  }
+  String jsonResponse;
+  serializeJson(doc, jsonResponse);
+  server.send(200, "application/json", jsonResponse);
+}
+
+void handleAddAutoSchedule() {
+  if (server.hasArg("plain")) {
+    String requestBody = server.arg("plain");
+    Serial.println("Add schedule request: " + requestBody);
+
+    DynamicJsonDocument doc(512);
+    DeserializationError err = deserializeJson(doc, requestBody);
+    if (err) {
+      Serial.print("Failed to parse addAutoSchedule JSON: ");
+      Serial.println(err.c_str());
+      server.send(400, "text/plain", "JSON_PARSE_ERROR");
+      return;
+    }
+
+    long sTime = doc["startTime"] | 0;
+    long eTime = doc["endTime"] | 0;
+    float targetTemp = doc["targetTemp"] | 0.0;
+    float targetHumid = doc["targetHumid"] | 0.0;
+
+    if (sTime <= 0 || eTime <= 0 || eTime <= sTime) {
+      Serial.println("Invalid time values");
+      server.send(400, "text/plain", "INVALID_TIME");
+      return;
+    }
+
+    // Compute min/max as ±0.3
+    const float delta = 0.3;
+    AutoControlSchedule newSchedule;
+    newSchedule.startTime = (time_t)sTime;
+    newSchedule.endTime = (time_t)eTime;
+    newSchedule.tempMin = targetTemp - delta;
+    newSchedule.tempMax = targetTemp + delta;
+    newSchedule.humidMin = targetHumid - delta;
+    newSchedule.humidMax = targetHumid + delta;
+
+    // push and sort
+    autoSchedules.push_back(newSchedule);
+    std::sort(autoSchedules.begin(), autoSchedules.end(), [](const AutoControlSchedule& a, const AutoControlSchedule& b) {
+        return a.startTime < b.startTime;
+    });
+    saveAutoSchedules();
+    Serial.println("Schedule added successfully. Total schedules: " + String(autoSchedules.size()));
+    server.send(200, "text/plain", "OK");
+  } else {
+    Serial.println("No request body found for add schedule");
+    server.send(400, "text/plain", "NO_BODY");
+  }
+}
+
+void handleRemoveAutoSchedule() {
+  if (server.hasArg("plain")) {
+    String requestBody = server.arg("plain");
+    Serial.println("Remove schedule request: " + requestBody);
+
+    StaticJsonDocument<128> doc;
+    DeserializationError error = deserializeJson(doc, requestBody);
+
+    if (error) {
+      Serial.print("JSON parsing error: ");
+      Serial.println(error.c_str());
+      server.send(400, "text/plain", "JSON_PARSE_ERROR");
+      return;
+    }
+
+    if (!doc.containsKey("index")) {
+      Serial.println("Missing 'index' field in request");
+      server.send(400, "text/plain", "MISSING_INDEX");
+      return;
+    }
+
+    int index = doc["index"];
+    Serial.println("Attempting to remove schedule at index: " + String(index));
+
+    if (index >= 0 && index < (int)autoSchedules.size()) {
+      Serial.println("Removing schedule at valid index: " + String(index));
+      autoSchedules.erase(autoSchedules.begin() + index);
+      saveAutoSchedules();
+      server.send(200, "text/plain", "OK");
+      Serial.println("Schedule removed successfully. Remaining schedules: " + String(autoSchedules.size()));
+    } else {
+      Serial.println("Invalid index: " + String(index) + ", size: " + String(autoSchedules.size()));
+      server.send(400, "text/plain", "INVALID_INDEX");
+    }
+  } else {
+    Serial.println("No request body found");
+    server.send(400, "text/plain", "NO_BODY");
+  }
+}
+
+// --- PERSISTENCE (SAVE/LOAD) FUNCTIONS ---
+void saveAutoSchedules() {
+  preferences.begin("auto_scheds", false);
+  DynamicJsonDocument doc(4096);
+  JsonArray array = doc.to<JsonArray>();
+  for (const auto& schedule : autoSchedules) {
+    JsonObject obj = array.add<JsonObject>();
+    obj["s"] = schedule.startTime;
+    obj["e"] = schedule.endTime;
+    obj["tmin"] = schedule.tempMin;
+    obj["tmax"] = schedule.tempMax;
+    obj["hmin"] = schedule.humidMin;
+    obj["hmax"] = schedule.humidMax;
+  }
+  String jsonStr;
+  serializeJson(doc, jsonStr);
+  preferences.putString("json", jsonStr);
+  preferences.end();
+  Serial.println("Auto-schedules saved to NVS.");
+}
+
+void loadAutoSchedules() {
+  preferences.begin("auto_scheds", true);
+  String jsonStr = preferences.getString("json", "[]");
+  preferences.end();
+  DynamicJsonDocument doc(4096);
+  DeserializationError error = deserializeJson(doc, jsonStr);
+  if(error) { Serial.println("Error loading schedules: " + String(error.c_str())); return; }
+
+  autoSchedules.clear();
+  for (JsonObject obj : doc.as<JsonArray>()) {
+    AutoControlSchedule schedule;
+    schedule.startTime = obj["s"];
+    schedule.endTime = obj["e"];
+    schedule.tempMin = obj["tmin"];
+    schedule.tempMax = obj["tmax"];
+    schedule.humidMin = obj["hmin"];
+    schedule.humidMax = obj["hmax"];
+    autoSchedules.push_back(schedule);
+  }
+  Serial.printf("Loaded %d auto-schedules from NVS.\n", (int)autoSchedules.size());
+}
+
+// --- UTILITY FUNCTIONS ---
+void updateLCD(){
+    lcd.clear();
+    lcd.setCursor(0, 0); lcd.printf("T:%.1fC H:%.1f%%", currentTemp, currentHumid);
+    lcd.setCursor(0, 1);
+    // Corrected logic for active-low relays
+    lcd.print("L:"); lcd.print(digitalRead(LIGHT_RELAY_PIN) == LOW ? "ON " : "OFF");
+    lcd.print(" H:"); lcd.print(digitalRead(HUMIDIFIER_RELAY_PIN) == LOW ? "ON " : "OFF");
+    lcd.print(" F:"); lcd.print(digitalRead(FAN_RELAY_PIN) == LOW ? "ON" : "OFF");
+    lcd.setCursor(0, 2);
+    if (hotspotMode) {
+        if (timeFromDeviceSet && isAutoModeActive) {
+            lcd.print("Mode: AUTO ACTIVE");
+        } else if (timeFromDeviceSet) {
+            lcd.print("Mode: AUTO READY");
+        } else {
+            lcd.print("Mode: NO TIME");
+        }
+    } else if (dbControlMode == "MANUAL") {
+        lcd.print("Mode: DB MANUAL");
+    } else if (isAutoModeActive) {
+        lcd.print("Mode: AUTO ACTIVE");
+    } else {
+        lcd.print("Mode: IDLE");
+    }
+    lcd.setCursor(0, 3);
+    if (hotspotMode) {
+        lcd.printf("192.168.4.1:%d", WEB_INTERFACE_PORT);
+    } else if (isConnectedToWifi) {
+        lcd.printf("%s:%d", WiFi.localIP().toString().c_str(), WEB_INTERFACE_PORT);
+    } else {
+        lcd.print("Offline");
+    }
+}
+
+void applyRelayState(int pin, bool state){
+  digitalWrite(pin, state ? LOW : HIGH); // Assumes active LOW relays
+  Serial.println("Relay on pin " + String(pin) + " set to " + (state ? "ON" : "OFF"));
+}
+
+void readDHTSensors(){
+    float t1, h1, t2, h2, t3, h3;
+    h1 = dht1.readHumidity(); t1 = dht1.readTemperature();
+    h2 = dht2.readHumidity(); t2 = dht2.readTemperature();
+    h3 = dht3.readHumidity(); t3 = dht3.readTemperature();
+    int validReadings = 0; float sumTemp = 0.0, sumHumid = 0.0;
+    if (!isnan(h1) && !isnan(t1)) { sumHumid += h1; sumTemp += t1; validReadings++; }
+    if (!isnan(h2) && !isnan(t2)) { sumHumid += h2; sumTemp += t2; validReadings++; }
+    if (!isnan(h3) && !isnan(t3)) { sumHumid += h3; sumTemp += t3; validReadings++; }
+    if (validReadings > 0) {
+        currentTemp = sumTemp / validReadings;
+        currentHumid = sumHumid / validReadings;
+        // Debug: Print sensor readings occasionally
+        static unsigned long lastPrint = 0;
+        if (millis() - lastPrint > 30000) { // Every 30 seconds
+            Serial.printf("Sensor readings - T: %.1f°C, H: %.1f%% (from %d sensors)\n", currentTemp, currentHumid, validReadings);
+            lastPrint = millis();
+        }
+    } else {
+        Serial.println("All DHT sensor readings failed!");
+    }
+}
+
+void reportToDB(){
+    if(!isConnectedToWifi || hotspotMode) return; // Don't report in hotspot mode
+    HTTPClient http;
+    String url = "http://" + String(XAMPP_SERVER_IP) + ":" + String(PHP_PORT) + String(REPORT_SCRIPT_PATH);
+    http.begin(url);
+    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+    String postData = "device_id=" + DEVICE_ID + "&avg_t=" + String(currentTemp, 2) + "&avg_h=" + String(currentHumid, 2) + "&light_on=" + String(lightState) + "&fan_on=" + String(fanState) + "&humid_on=" + String(humidifierState);
+    int httpCode = http.POST(postData);
+    if (httpCode > 0) {
+        String response = http.getString();
+        Serial.println("DB Report response: " + response);
+    } else {
+        Serial.printf("DB Report failed, error: %d\n", httpCode);
+    }
+    http.end();
+}
+
+// --- WIFI & HOTSPOT MANAGEMENT FUNCTIONS ---
+void startWiFiConnection() {
+  wifiManager.setConnectTimeout(60);
+
+  wifiManager.setConfigPortalTimeout(180);
+
+  if (wifiManager.autoConnect("Incubator_Setup")) {
+    isConnectedToWifi = true;
+    hotspotMode = false;
+    Serial.println("WiFi Connected!");
+    Serial.printf("Custom Web Interface: http://%s:%d\n", WiFi.localIP().toString().c_str(), WEB_INTERFACE_PORT);
+    Serial.printf("Database Communication Port: %d\n", PHP_PORT);
+  } else {
+    isConnectedToWifi = false;
+    hotspotMode = false;
+    Serial.println("WiFi connection failed or timed out.");
+  }
+}
+
+void startHotspotMode() {
+  // Start ESP32 as Access Point
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP("Incubator_Setup", ""); // Open network, no password
+
+  // Start DNS server for captive portal-like behavior
+  dnsServer.start(53, "*", WiFi.softAPIP());
+
+  hotspotMode = true;
+  isConnectedToWifi = false;
+
+  Serial.println("Hotspot Mode Activated");
+  Serial.println("SSID: Incubator_Setup");
+  Serial.printf("Hotspot IP: %s\n", WiFi.softAPIP().toString().c_str());
+  Serial.printf("Custom Web Interface: http://%s:%d\n", WiFi.softAPIP().toString().c_str(), WEB_INTERFACE_PORT);
+  Serial.println("Connect to 'Incubator_Setup' WiFi network and go to 192.168.4.1:8080");
+  Serial.println("Time will be automatically synced from your device when you access the web interface.");
+}
+
+void broadcastDeviceInfo() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  String message = "{";
+  message += "\"device_id\":\"" + DEVICE_ID + "\",";
+  message += "\"ip\":\"" + WiFi.localIP().toString() + "\"";
+  message += "}";
+
+  IPAddress broadcastIp(255, 255, 255, 255); // broadcast to all on LAN
+  broadcastUDP.beginPacket(broadcastIp, udpPort);
+  broadcastUDP.print(message);
+  broadcastUDP.endPacket();
+
+  Serial.println("Broadcasted: " + message);
+}
+// --- NEW HANDLERS FOR PAIRING AND CONTROL ---
+
+void handlePair() {
+  if (!server.hasArg("plain")) {
+    server.send(400, "text/plain", "Bad Request");
+    return;
+  }
+
+  // Only allow pairing if not already paired
+  if (!pairedPhoneId.isEmpty()) {
+    server.send(403, "text/plain", "Device already paired");
+    return;
+  }
+
+  String body = server.arg("plain");
+  DynamicJsonDocument doc(128);
+  deserializeJson(doc, body);
+
+  String phoneId = doc["phone_id"];
+  if (phoneId.isEmpty()) {
+    server.send(400, "text/plain", "Missing phone_id");
+    return;
+  }
+
+  // Save the phone's ID to permanent storage
+  preferences.begin("device-config", false); // false for read-write
+  preferences.putString("paired_id", phoneId);
+  preferences.end();
+  pairedPhoneId = phoneId;
+
+  Serial.println("Device paired with phone: " + phoneId);
+  server.send(200, "text/plain", "Paired Successfully");
+}
+
+void handleSetName() {
+  if (!server.hasArg("plain")) { server.send(400, "text/plain", "Bad Request"); return; }
+
+  String body = server.arg("plain");
+  DynamicJsonDocument doc(256);
+  deserializeJson(doc, body);
+
+  String phoneId = doc["phone_id"];
+  String newName = doc["name"];
+
+  // Security check: Only the paired phone can set the name
+  if (phoneId.isEmpty() || phoneId != pairedPhoneId) {
+    server.send(403, "text/plain", "Forbidden: Not the paired device");
+    return;
+  }
+
+  preferences.begin("device-config", false);
+  preferences.putString("device_name", newName);
+  preferences.end();
+
+  Serial.println("Device name set to: " + newName);
+  server.send(200, "text/plain", "Name Updated");
+}
+
+void handleUnpair() {
+    if (!server.hasArg("plain")) { server.send(400, "text/plain", "Bad Request"); return; }
+
+    String body = server.arg("plain");
+    DynamicJsonDocument doc(128);
+    deserializeJson(doc, body);
+    String phoneId = doc["phone_id"];
+
+    if (phoneId.isEmpty() || phoneId != pairedPhoneId) {
+      server.send(403, "text/plain", "Forbidden: Not the paired device");
+      return;
+    }
+
+    preferences.begin("device-config", false);
+    preferences.clear();
+    preferences.end();
+
+    wifiManager.resetSettings();
+
+    server.send(200, "text/plain", "Unpaired. Device will reboot shortly.");
+
+    // Set the flag to reboot instead of rebooting immediately
+    rebootPending = true;
+}
